@@ -168,6 +168,12 @@ export class DurableAgent {
     if (sendFinish || !preventClose) {
       await closeStream(options.writable, preventClose, sendFinish);
     }
+
+    // The iterator returns the final conversation prompt (LanguageModelV2Prompt)
+    // which is compatible with ModelMessage[]
+    const messages = result.value as ModelMessage[];
+
+    return { messages };
   }
 }
 
@@ -215,7 +221,7 @@ async function executeTool(
   try {
     const toolResult = await tool.execute(input.value, {
       toolCallId: toolCall.toolCallId,
-      // TODO: pass the proper messages to the tool
+      // TODO: pass the proper messages to the tool (we'd need to pass them through the iterator)
       messages: [],
     });
 
