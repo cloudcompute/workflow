@@ -454,31 +454,27 @@ export abstract class BaseBuilder {
     // log the workflow files for debugging
     await this.writeDebugFile(outfile, { workflowFiles });
 
-    // Create a virtual entry that imports all files
-    const imports =
-      `globalThis.__private_workflows = new Map();\n` +
-      workflowFiles
-        .map((file, workflowFileIdx) => {
-          // Normalize both paths to forward slashes before calling relative()
-          // This is critical on Windows where relative() can produce unexpected results with mixed path formats
-          const normalizedWorkingDir = this.config.workingDir.replace(
-            /\\/g,
-            '/'
-          );
-          const normalizedFile = file.replace(/\\/g, '/');
-          // Calculate relative path from working directory to the file
-          let relativePath = relative(
-            normalizedWorkingDir,
-            normalizedFile
-          ).replace(/\\/g, '/');
-          // Ensure relative paths start with ./ so esbuild resolves them correctly
-          if (!relativePath.startsWith('.')) {
-            relativePath = `./${relativePath}`;
-          }
-          return `import * as workflowFile${workflowFileIdx} from '${relativePath}';
-            Object.values(workflowFile${workflowFileIdx}).map(item => item?.workflowId && globalThis.__private_workflows.set(item.workflowId, item))`;
-        })
-        .join('\n');
+    // Create a virtual entry that imports all workflow files
+    // The SWC plugin in workflow mode emits `globalThis.__private_workflows.set(workflowId, fn)`
+    // calls directly, so we just need to import the files (Map is initialized via banner)
+    const imports = workflowFiles
+      .map((file) => {
+        // Normalize both paths to forward slashes before calling relative()
+        // This is critical on Windows where relative() can produce unexpected results with mixed path formats
+        const normalizedWorkingDir = this.config.workingDir.replace(/\\/g, '/');
+        const normalizedFile = file.replace(/\\/g, '/');
+        // Calculate relative path from working directory to the file
+        let relativePath = relative(
+          normalizedWorkingDir,
+          normalizedFile
+        ).replace(/\\/g, '/');
+        // Ensure relative paths start with ./ so esbuild resolves them correctly
+        if (!relativePath.startsWith('.')) {
+          relativePath = `./${relativePath}`;
+        }
+        return `import '${relativePath}';`;
+      })
+      .join('\n');
 
     const bundleStartTime = Date.now();
     const workflowManifest: WorkflowManifest = {};
@@ -503,6 +499,12 @@ export abstract class BaseBuilder {
       treeShaking: true,
       keepNames: true,
       minify: false,
+      // Initialize the workflow registry at the very top of the bundle
+      // This must be in banner (not the virtual entry) because esbuild's bundling
+      // can reorder code, and the .set() calls need the Map to exist first
+      banner: {
+        js: 'globalThis.__private_workflows = new Map();',
+      },
       // Inline source maps for better stack traces in workflow VM execution.
       // This intermediate bundle is executed via runInContext() in a VM, so we need
       // inline source maps to get meaningful stack traces instead of "evalmachine.<anonymous>".
