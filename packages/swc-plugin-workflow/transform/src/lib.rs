@@ -3,10 +3,10 @@ mod naming;
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use swc_core::{
-    common::{DUMMY_SP, SyntaxContext, errors::HANDLER},
+    common::{errors::HANDLER, SyntaxContext, DUMMY_SP},
     ecma::{
         ast::*,
-        visit::{VisitMut, VisitMutWith, noop_visit_mut_type},
+        visit::{noop_visit_mut_type, VisitMut, VisitMutWith},
     },
 };
 
@@ -2230,6 +2230,45 @@ impl StepTransform {
         }))
     }
 
+    // Create a registration call statement: registerSerializationClass("class//...", ClassName)
+    // Used in workflow mode and client mode to register classes for serialization
+    fn create_class_serialization_registration(&self, class_name: &str) -> Stmt {
+        let class_id = naming::format_name("class", &self.filename, class_name);
+        Stmt::Expr(ExprStmt {
+            span: DUMMY_SP,
+            expr: Box::new(Expr::Call(CallExpr {
+                span: DUMMY_SP,
+                ctxt: SyntaxContext::empty(),
+                callee: Callee::Expr(Box::new(Expr::Ident(Ident::new(
+                    "registerSerializationClass".into(),
+                    DUMMY_SP,
+                    SyntaxContext::empty(),
+                )))),
+                args: vec![
+                    // First argument: class ID
+                    ExprOrSpread {
+                        spread: None,
+                        expr: Box::new(Expr::Lit(Lit::Str(Str {
+                            span: DUMMY_SP,
+                            value: class_id.into(),
+                            raw: None,
+                        }))),
+                    },
+                    // Second argument: ClassName
+                    ExprOrSpread {
+                        spread: None,
+                        expr: Box::new(Expr::Ident(Ident::new(
+                            class_name.into(),
+                            DUMMY_SP,
+                            SyntaxContext::empty(),
+                        ))),
+                    },
+                ],
+                type_args: None,
+            })),
+        })
+    }
+
     // Create a proxy reference: globalThis[Symbol.for("WORKFLOW_USE_STEP")]("step_id", closure_fn) (workflow mode)
     fn create_step_proxy_reference(&self, step_id: &str, closure_vars: &[String]) -> Expr {
         let mut args = vec![ExprOrSpread {
@@ -3239,7 +3278,13 @@ impl VisitMut for StepTransform {
                         }
                     }
                     TransformMode::Client => {
-                        // No imports needed for client mode since step functions are not transformed
+                        // In client mode, we still need class serialization registration
+                        // so that classes can be serialized when passed to start(workflow)
+                        let needs_class_serialization =
+                            !self.classes_needing_serialization.is_empty();
+                        if needs_class_serialization {
+                            imports_to_add.push(self.create_class_serialization_import());
+                        }
                     }
                 }
 
@@ -3710,43 +3755,22 @@ impl VisitMut for StepTransform {
                         self.classes_needing_serialization.drain().collect();
                     sorted_classes.sort();
                     for class_name in sorted_classes {
-                        // Generate class ID: class//filename//ClassName
-                        let class_id = naming::format_name("class", &self.filename, &class_name);
+                        let registration_call =
+                            self.create_class_serialization_registration(&class_name);
+                        module.body.push(ModuleItem::Stmt(registration_call));
+                    }
+                }
 
-                        // Create: registerSerializationClass("class//...", ClassName)
-                        let registration_call = Stmt::Expr(ExprStmt {
-                            span: DUMMY_SP,
-                            expr: Box::new(Expr::Call(CallExpr {
-                                span: DUMMY_SP,
-                                ctxt: SyntaxContext::empty(),
-                                callee: Callee::Expr(Box::new(Expr::Ident(Ident::new(
-                                    "registerSerializationClass".into(),
-                                    DUMMY_SP,
-                                    SyntaxContext::empty(),
-                                )))),
-                                args: vec![
-                                    // First argument: class ID
-                                    ExprOrSpread {
-                                        spread: None,
-                                        expr: Box::new(Expr::Lit(Lit::Str(Str {
-                                            span: DUMMY_SP,
-                                            value: class_id.into(),
-                                            raw: None,
-                                        }))),
-                                    },
-                                    // Second argument: ClassName
-                                    ExprOrSpread {
-                                        spread: None,
-                                        expr: Box::new(Expr::Ident(Ident::new(
-                                            class_name.into(),
-                                            DUMMY_SP,
-                                            SyntaxContext::empty(),
-                                        ))),
-                                    },
-                                ],
-                                type_args: None,
-                            })),
-                        });
+                // Add class serialization registrations for client mode
+                // In client mode, we need classes to be registered so that serialization works
+                // when passing class instances to start(workflow)
+                if matches!(self.mode, TransformMode::Client) {
+                    let mut sorted_classes: Vec<_> =
+                        self.classes_needing_serialization.drain().collect();
+                    sorted_classes.sort();
+                    for class_name in sorted_classes {
+                        let registration_call =
+                            self.create_class_serialization_registration(&class_name);
                         module.body.push(ModuleItem::Stmt(registration_call));
                     }
                 }
@@ -3935,7 +3959,13 @@ impl VisitMut for StepTransform {
                             }
                         }
                         TransformMode::Client => {
-                            // No imports needed for workflow mode
+                            // In client mode, we still need class serialization registration
+                            // so that classes can be serialized when passed to start(workflow)
+                            let needs_class_serialization =
+                                !self.classes_needing_serialization.is_empty();
+                            if needs_class_serialization {
+                                module_items.push(self.create_class_serialization_import());
+                            }
                         }
                     }
 
@@ -3948,6 +3978,18 @@ impl VisitMut for StepTransform {
                     if matches!(self.mode, TransformMode::Step) {
                         for call in self.registration_calls.drain(..) {
                             module_items.push(ModuleItem::Stmt(call));
+                        }
+                    }
+
+                    // Add class serialization registrations for client mode (Script case)
+                    if matches!(self.mode, TransformMode::Client) {
+                        let mut sorted_classes: Vec<_> =
+                            self.classes_needing_serialization.drain().collect();
+                        sorted_classes.sort();
+                        for class_name in sorted_classes {
+                            let registration_call =
+                                self.create_class_serialization_registration(&class_name);
+                            module_items.push(ModuleItem::Stmt(registration_call));
                         }
                     }
 
